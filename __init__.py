@@ -7,7 +7,7 @@ from nonebot.adapters.onebot.v11 import Bot, MessageEvent, MessageSegment, Messa
 from .builder import build_pjsk_markdown
 from .render import get_mizuki_help_image
 from .data_source import HELP_MD_MENUS, HELP_IMG_DATA, HELP_PAGE_ORDER
-from .proxy_core import start_gateway, stop_gateway
+from .proxy_core import PJSK_RELAY_ENABLED, _route_for, dispatch_message, start_gateway, stop_gateway
 
 
 @get_driver().on_startup
@@ -56,6 +56,58 @@ _pjsk_block = on_regex(
     r"^[/\s]*(?:cn|tw|kr|en|jp)?\s*pjsk\s*(?:表情制作|-h)",
     flags=re.IGNORECASE, priority=4, block=True
 )
+
+
+def _is_pjsk_backend_message(event: MessageEvent) -> bool:
+    """Match only commands that belong to Haruki/Sakura."""
+
+    if not PJSK_RELAY_ENABLED:
+        return False
+    raw = event.get_plaintext().strip()
+    if not raw:
+        return False
+    haruki, sakura, blocked = _route_for(raw)
+    return not blocked and (haruki or sakura)
+
+
+# Help/local-only matchers use higher priority; this matcher only handles the
+# remaining PJSK command family and never opens the former 8113 ingress socket.
+pjsk_backend_relay = on_regex(
+    r"^[/\s]*(?:cn|tw|kr|en|jp)?\s*pjsk\S*(?:\s+.*)?$",
+    flags=re.IGNORECASE,
+    priority=6,
+    block=True,
+)
+
+# Haruki also accepts regional commands without the ``pjsk`` prefix, for
+# example ``/cn个人信息``.  Use a deterministic regex matcher here: the
+# previous generic on_message rule was not selected by the live matcher chain.
+# Keep it limited to explicit regional prefixes so ordinary local commands
+# such as ``个人信息`` remain untouched.
+haruki_regional_relay = on_regex(
+    r"^[/\s]*(?:cn|tw|kr|en|jp)(?!pjsk)\s*[^\s/].*",
+    flags=re.IGNORECASE,
+    priority=6,
+    block=True,
+)
+
+
+async def _relay_pjsk_command(matcher, bot: Bot, event: MessageEvent):
+    result = await dispatch_message(bot, event)
+    if result.get("matched") and not result.get("sent"):
+        await matcher.finish("PJSK 后端暂未连接，请稍后重试。")
+
+
+@pjsk_backend_relay.handle()
+async def _relay_pjsk_command_with_prefix(bot: Bot, event: MessageEvent):
+    await _relay_pjsk_command(pjsk_backend_relay, bot, event)
+
+
+@haruki_regional_relay.handle()
+async def _relay_haruki_regional_command(bot: Bot, event: MessageEvent):
+    await _relay_pjsk_command(haruki_regional_relay, bot, event)
+
+
 @_pjsk_block.handle()
 async def _block_pjsk_noise():
     # ponytail: 静默吃掉，不下发给后端

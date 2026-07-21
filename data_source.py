@@ -40,7 +40,7 @@ HELP_MD_MENUS: Dict[str, Dict[str, Any]] = {
             "> **详情**：`/个人信息` / `pjskdetail`\n"
             "> **高分统计**：`rk` / `b39` / `pjsk b30`\n"
             "> **过曲进度**：`进度` / `pjsk进度ex/apd`\n\n"
-            "> 🔗 **上传数据**: Haruki <https://haruki.seiunx.com/> | Sakura <http://go.mikuware.top/>"
+            "> 🔗 **上传数据**: Haruki <https://haruki.seiunx.com/> | Sakura <https://sakura-bot.cn>"
         ),
         "buttons": [
             [
@@ -319,7 +319,7 @@ HELP_IMG_DATA: Dict[str, List[dict]] = {
         {"name": "设置主账号", "desc": "设置默认查询主账号。"},
         {"name": "pjskprofile/视奸", "desc": "查看他人信息 (需对方开启给看)。"},
         {"name": "给看/不给看", "desc": "控制是否允许被视奸。"},
-        {"name": "上传数据页面", "desc": "Haruki: https://haruki.seiunx.com/\nSakura: http://go.mikuware.top/"}
+        {"name": "上传数据页面", "desc": "Haruki: https://haruki.seiunx.com/\nSakura: https://sakura-bot.cn\nSakura 上传: https://upload.sakura-bot.cn"}
     ],
     "乐曲": [
         {"name": "/查曲 <名称/别名>", "desc": "查询单曲详情。"},
