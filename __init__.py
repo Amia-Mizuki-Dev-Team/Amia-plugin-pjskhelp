@@ -17,7 +17,7 @@ from .proxy_core import (
     start_gateway,
     stop_gateway,
 )
-from src.plugins.amia_core.release010 import HXCodeError, send_error_with_diagnostic
+from .release010_import import HXCodeError, send_error_with_diagnostic
 
 
 @get_driver().on_startup
