@@ -1,0 +1,42 @@
+gensokyo:
+  last_verified_release: "010"
+  verified_at: ""
+  baseline_commit: ""
+  modes:
+    string_message:
+      status: unverified
+      evidence: []
+    array_message:
+      status: automated
+      evidence: ["tests/test_proxy_core.py::TestProxyCore.test_backend_private_wakeup_preserves_media_segments"]
+    use_uin_true:
+      status: unverified
+      evidence: []
+    use_uin_false:
+      status: unverified
+      evidence: []
+    markdown:
+      status: automated
+      evidence: ["tests/test_proxy_core.py::TestProxyCore.test_plain_web_urls_are_markdownized_for_official_bots"]
+    keyboard:
+      status: unverified
+      evidence: []
+    file_segment:
+      status: automated
+      evidence: ["tests/test_proxy_core.py::TestProxyCore.test_backend_private_wakeup_preserves_media_segments"]
+  automated_tested: true
+  live_tested: false
+  chunithm:
+    backend: "Sakura 13888"
+    data_source: "DivingFish"
+    region: "CN"
+    local_cache: false
+    live_tested: false
+    commands:
+      - "chusearch"
+      - "chuinfo"
+      - "chuchart"
+      - "chu b30"
+    artwork_attribution: "Uni (GitHub @watagashi-uni)"
+  known_issues:
+    - "实际 Gensokyo 010 反向 WebSocket 和 QQ 客户端展示仍需在用户测试环境确认。"

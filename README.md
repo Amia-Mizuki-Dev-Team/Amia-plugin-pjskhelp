@@ -1,39 +1,64 @@
 # Amia-plugin-pjskhelp
 
-PJSK 综合帮助与后端指令网关。
+PJSK 综合帮助、Haruki/Sakura 命令路由和 Release010 消息兼容网关。正式本地源码来自 `H:\Amia-Develop\src\plugins\pjskhelp`。
 
-## 项目定位
+## 功能边界
 
-本插件同时提供 PJSK 帮助入口和 Haruki/Sakura 后端指令转发。帮助内容与后端转发是两个边界明确的部分：帮助命令由本插件本地生成，后端命令按路由规则通过本地 WebSocket 网关转发。
+插件包含两部分：
 
-## 当前功能
+1. 本地帮助：生成 PJSK 分类帮助、分页菜单和图片；
+2. 后端网关：把已知命令按规则转发到 Haruki、Sakura 或两者。
 
-- `pjsk帮助`、`pjskhelp` 及区域前缀命令；
-- 官方 Bot ID `3889004352`、`3889047402` 使用 Markdown 和按钮菜单；
-- 普通 Bot 使用 HTML 渲染的图片帮助；
-- 帮助菜单支持分类和上一页/下一页按钮；
-- `pjskhelp`、`pjsk表情`、`pjsk表情制作`、`pjsk -h` 等本地命令拦截，不转发到后端；
-- 共享命令可同时发送到 Haruki 和 Sakura；
-- Haruki、Sakura 独有命令按命令集合路由；
-- Sakura 转发前可通过 QBind 将虚拟 user_id 改为真实 QQ；
-- 启动本地 WebSocket 入口并维护两个后端连接；
-- 后端断开后按 3 秒、30 秒、300 秒退避重连；
-- NoneBot 关闭时取消后台任务并关闭本地监听。
+它不复制后端完整业务实现，也不直接读取 maimaidx、Economy 或其他插件数据库。
 
-## 指令路由
+## 帮助指令
 
-路由顺序是：本地拦截 → 共享命令 → Haruki 命令或 Sakura 命令。带 `pjsk` 前缀但未命中已知后端命令的消息会被视为本地未转发消息。后端未连接时，调用方收到“PJSK 后端暂未连接，请稍后重试”。
+```text
+pjsk帮助
+pjskhelp
+pjsk -h
+pjsk表情
+pjsk表情制作
+```
 
-后端 API 还对 `get_login_info`、`get_version_info`、`get_status`、`get_group_list` 和 `get_friend_list` 提供网关层响应；其他带 echo 的请求按连接路由返回。
+官方 Bot ID 使用 Markdown 与按钮菜单；其他 Bot 使用 HTML 渲染图片，渲染失败时返回带 `HX-PJSK-*` 错误码的中文提示和脱敏诊断文件。
 
-## 官方 Bot 与普通 Bot
+## 后端路由
 
-| 场景 | 输出 |
-| --- | --- |
-| Bot ID 为 `3889004352` 或 `3889047402` | Markdown 文本、按钮和分页导航 |
-| 其他 Bot | HTML 渲染图片，渲染失败时返回错误提示 |
+路由顺序：
 
-官方 Bot ID 目前硬编码在 `__init__.py`，不是配置项；需要新增官方 Bot 时必须同步代码和测试。
+```text
+本地拦截 → 共享命令 → Haruki 专属 → Sakura 专属 → 不转发
+```
+
+后端未连接时不会阻止帮助菜单加载。连接会按 3 秒、30 秒、300 秒退避重试，NoneBot 关闭时取消后台任务和本地监听。
+
+## Chunithm（Sakura 13888）
+
+以下命令只路由到 Sakura：
+
+```text
+chusearch <歌曲名>
+chuinfo <歌曲ID>
+chuchart <歌曲ID> [ex|ma|ult]
+chu b30
+```
+
+- `chusearch` 不区分大小写，只按歌曲名称匹配；
+- `chuinfo` 只接受歌曲 ID；
+- `chuchart` 只接受歌曲 ID，可追加 Expert、Master、Ultima 难度后缀；
+- `chu b30` 查询 B30、R10 和总 Rating；
+- 当前仅支持国服，数据来源于 DivingFish；
+- 图片设计归属按上游说明保留，不在本仓库删除署名。
+
+## Release010 身份与消息
+
+- `self_id`、`user_id` 保留字符串/OpenID，不强制转为整数；
+- Sakura 转发可通过 QBind 将平台身份映射为真实 QQ；
+- 后端图片 URL 会重新下载并转换为 `base64://`，避免 QQ 复用旧 URL 上传缓存；
+- 普通网页链接在官方 Bot 路径转换为 Markdown；
+- 后端错误不会把长 traceback 直接发给用户；
+- `HX-PJSK-*` 错误会附带脱敏诊断文件，并提示将错误移交开发者群 `1053964431`。
 
 ## 配置
 
@@ -48,25 +73,18 @@ SAKURA_BOT_ID=3889004352
 PJSK_GATEWAY_IDENTITY_QQS=
 ```
 
-生产环境应通过环境变量覆盖地址、端口、Token、Sakura Bot ID 和身份列表；README 不记录真实 Token 或内网凭据。默认 Sakura 地址属于现有代码的默认值，不应视为可用性保证。
+Token 只能通过本地环境变量提供，不得写入 README、日志、诊断文件或 Git 历史。默认公网地址仅表示当前路由默认值，不是可用性承诺。
 
-## 后端断线行为
-
-启动后分别维护 Haruki 和 Sakura WebSocket。连接失败或断开会记录 warning，并使用 3 秒、30 秒、300 秒的退避继续连接；NoneBot 关闭时不等待无限重连。后端未连接不会阻止帮助菜单加载。
-
-## 测试方法
-
-当前仓库没有独立测试目录。至少应执行：
+## 测试
 
 ```powershell
+python -m unittest discover -s tests -v
 python -m compileall -q .
+git diff --check
 ```
 
-并补充离线测试覆盖：官方/普通 Bot 分支、帮助分页、区域前缀、共享命令双路由、本地拦截、未知命令不转发、后端未连接提示、重连退避、Sakura 身份改写、echo 回包和关闭清理。
+离线测试覆盖命令路由、Chunithm 大小写、Sakura 独占转发、OpenID、官方 Bot Markdown、远端图片重上传、WebSocket 头、回包和错误降级。真实 13888 后端、QQ Markdown/Keyboard、图片展示和诊断文件发送未执行时保持 `NOT RUN`。
 
-## 维护边界
+## 发布边界
 
-- 不在帮助网关中复制 PJSK 业务插件的全部实现；
-- 不直接读取 maimaidx、Economy 或其他业务数据库；
-- 不把 Sakura 默认公网地址当成稳定服务承诺；
-- 不把规划中的新路由、后端能力或官方 Bot ID 写成当前已实现。
+仓库发布代码、模板、脱敏命令目录、测试和兼容状态。不得提交 Token、真实用户映射、原始聊天日志、缓存、截图或生产配置。

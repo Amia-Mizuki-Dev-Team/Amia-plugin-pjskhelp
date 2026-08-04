@@ -9,8 +9,10 @@ original NoneBot event.
 from __future__ import annotations
 
 import asyncio
+from base64 import b64encode
 import json
 import os
+from pathlib import Path
 import re
 import time
 from contextlib import suppress
@@ -82,8 +84,6 @@ LOCAL_ONLY_RE = [
     re.compile(r"^\s*pjsk\s*(?:" + _u(r"\u6f2b\u753b|\u8d44\u6e90\u72b6\u6001") + r")(?:\s|$|\d)", re.I),
     re.compile(
         r"^\s*(?:cn|tw|kr|en|jp)?\s*pjsk\s*(?:-h|"
-        + _u(r"\u8868\u60c5")
-        + r"|"
         + _u(r"\u8868\u60c5\u5236\u4f5c")
         + r")",
         re.I,
@@ -101,7 +101,7 @@ SHARED_CMDS = {
     _u(r"\u65e5\u901f"), _u(r"\u67e5\u623f"), _u(r"\u7ec4\u5361"),
     _u(r"\u6d3b\u52a8\u7ec4\u5361"), _u(r"\u6311\u6218\u7ec4\u5361"),
     _u(r"\u6700\u5f3a\u7ec4\u5361"), _u(r"\u5bb6\u5177\u5217\u8868"),
-    _u(r"mysekai\u7167\u7247"), _u(r"\u902e\u6355"),
+    _u(r"mysekai\u7167\u7247"),
 }
 
 HARUKI_CMDS = {
@@ -121,14 +121,26 @@ HARUKI_CMDS = {
     _u(r"\u4e2a\u4eba\u4fe1\u606f"), _u(r"\u4e2a\u4eba\u4e2d\u5fc3"),
     _u(r"\u7ed1\u5b9a\u5217\u8868"), _u(r"\u4ea4\u6362\u7ed1\u5b9a"),
     _u(r"\u4e3b\u8d26\u53f7"), _u(r"\u9a8c\u8bc1"), _u(r"\u67e5\u5361\u6c60"),
+    # Haruki 的中文账号/抓包入口。区域指令会先去掉 cn，再使用这里的别名匹配。
+    _u(r"\u6293\u5305\u6570\u636e"), _u(r"\u70e4\u68ee\u6293\u5305"),
+    _u(r"\u9690\u85cf\u6293\u5305"), _u(r"\u5c55\u793a\u6293\u5305"),
+    _u(r"\u663e\u793a\u6293\u5305"), _u(r"\u9690\u85cfID"), _u(r"\u663e\u793aID"),
+    _u(r"\u8fdb\u5ea6"), _u(r"\u67e5\u65f6\u95f4"), _u(r"\u6ce8\u518c\u65f6\u95f4"),
+    _u(r"\u902e\u6355"),
 }
 
 SAKURA_CMDS = {
+    # Sakura 13888 Chunithm relay. Arguments are intentionally passed through
+    # unchanged so Sakura can apply its DivingFish CN data semantics.
+    "chusearch", "chuinfo", "chuchart", "chu b30",
     "pjskprofile", "b39", "b30", "pjskdetail", "pjskcard", "pjskevent",
-    "ss", "wlss", "pinfo", "charinfo", "findcard", "cardinfo", "findevent",
+    "rk", "id", "ss", "wlss", "pinfo", "pset", "pdel",
+    "charinfo", "charset", "chardel",
+    "findcard", "cardinfo", "findevent",
     _u(r"\u7ed9\u770b"), _u(r"\u4e0d\u7ed9\u770b"), _u(r"\u89c6\u5978"),
     _u(r"b30\u5220\u6b4c"), _u(r"b30\u6062\u590d\u6b4c"),
-    _u(r"b30\u5220\u6b4c\u5217\u8868"), _u(r"\u8fdb\u5ea6ex"),
+    _u(r"b30\u8fd8\u539f\u6b4c"), _u(r"b30\u5220\u6b4c\u5217\u8868"),
+    _u(r"\u5207\u7ed1\u5b9a"), _u(r"\u8fdb\u5ea6ex"),
     _u(r"\u8fdb\u5ea6apd"), _u(r"\u5bb6\u5177\u8be6\u60c5"),
     _u(r"\u6ce8\u518c"), _u(r"\u5206\u6570\u7ebf"),
     _u(r"5v5\u80dc\u7387"), _u(r"5v5\u5206\u6570"),
@@ -137,12 +149,42 @@ SAKURA_CMDS = {
     _u(r"\u7ed3\u675f\u731c\u5361\u9762"), _u(r"pjsk\u62bd\u5361"),
     _u(r"\u62bd\u5361"), _u(r"\u53cd\u62bd\u5361"), _u(r"\u770b"),
     _u(r"\u968f\u4e2a"), _u(r"\u8471\u4ec0\u4e48"),
+    _u(r"\u5f00\u542flive\u8ba2\u9605"), _u(r"\u5f00\u542flive\u63a8\u9001"),
+    _u(r"\u5f00\u542flive\u901a\u77e5"), _u(r"\u5173\u95edlive\u8ba2\u9605"),
+    _u(r"\u5173\u95edlive\u63a8\u9001"), _u(r"\u5173\u95edlive\u901a\u77e5"),
 }
 
+
+def _load_documented_haruki_commands() -> set[str]:
+    """Load the generated Haruki NEO command catalog without network access."""
+
+    catalog_path = Path(__file__).with_name("haruki_commands.json")
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        commands = catalog.get("commands", [])
+        return {
+            str(command).strip().lstrip("/").strip().lower()
+            for command in commands
+            if str(command).strip().startswith("/")
+        }
+    except FileNotFoundError:
+        logger.warning("Haruki command catalog is missing; using built-in aliases only")
+    except Exception as exc:
+        logger.warning(f"Haruki command catalog could not be loaded: {type(exc).__name__}")
+    return set()
+
+
+HARUKI_DOCUMENTED_CMDS = _load_documented_haruki_commands()
+HARUKI_CMDS.update(HARUKI_DOCUMENTED_CMDS)
+
 PREFIX_RE = re.compile(r"^\s*(?:cn|tw|kr|en|jp)?\s*(?:pjsk|sk)?\s*", re.I)
-PJSK_PREFIX_RE = re.compile(r"^\s*(?:cn|tw|kr|en|jp)?\s*(?:pjsk|sk)\b", re.I)
+PJSK_PREFIX_RE = re.compile(r"^\s*(?:cn|tw|kr|en|jp)?\s*(?:pjsk|sk)(?![a-z0-9_])", re.I)
+REGIONAL_PREFIX_RE = re.compile(r"^\s*(?:cn|tw|kr|en|jp)(?!pjsk)", re.I)
 COMPACT_B39_RE = re.compile(r"^\s*(?:cn|tw|kr|en|jp)?\s*pjskb39(?:\s|$)", re.I)
 SPACED_B39_RE = re.compile(r"^\s*(?:cn|tw|kr|en|jp)?\s*pjsk\s+b39(?:\s|$)", re.I)
+SAKURA_DYNAMIC_RE = [
+    re.compile(r"^\s*(?:cn|tw)?\s*pjsk\d+\u8fde(?:\s|$)", re.I),
+]
 
 
 @dataclass(slots=True)
@@ -158,6 +200,19 @@ _reply_routes: dict[str, ReplyTarget] = {}
 _tasks: list[asyncio.Task] = []
 _heartbeat_tasks: set[asyncio.Task] = set()
 _message_cache: dict[str, float] = {}
+
+# QQ 公域群对外链图片的接受条件比测试群更严格。将后端返回的远程图片
+# 转成 OneBot 的 base64 图片后再交给 Gensokyo 上传，可以避免 QQ 直接抓取
+# Haruki 图片缓存地址失败。限制大小，防止异常后端响应占满内存。
+_REMOTE_IMAGE_MAX_BYTES = 16 * 1024 * 1024
+_REMOTE_IMAGE_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=5, sock_read=10)
+_REMOTE_IMAGE_PROXY = os.getenv("PJSK_IMAGE_PROXY", "").strip()
+_MARKDOWN_BOT_IDS = {
+    value.strip()
+    for value in os.getenv("PJSK_MARKDOWN_BOT_IDS", "3889004352,3889047402").split(",")
+    if value.strip()
+}
+_PLAIN_URL_RE = re.compile(r"https?://[^\s<>\]\)]+", re.I)
 
 
 def _backoff(fail_count: int) -> int:
@@ -262,26 +317,46 @@ def _route_for(text: str) -> tuple[bool, bool, bool]:
         return False, False, True
     if check.strip().lower() == "pjskprofile":
         return False, True, False
+    if any(pattern.match(check) for pattern in SAKURA_DYNAMIC_RE):
+        return False, True, False
+
+    documented_haruki = _match_command(check, HARUKI_DOCUMENTED_CMDS)
     shared = _match_command(check, SHARED_CMDS)
     haruki = _match_command(check, HARUKI_CMDS)
     sakura = _match_command(check, SAKURA_CMDS)
-    if shared:
-        haruki = sakura = True
+
+    # Prefer the current Haruki NEO documentation when an alias exists on both
+    # services. Sakura receives only its legacy/specialized command surface.
+    if documented_haruki:
+        return True, False, False
+    if sakura:
+        return False, True, False
+    if haruki or shared:
+        return True, False, False
     if PJSK_PREFIX_RE.match(check) and not (haruki or sakura):
+        # Unknown pjsk text used to wake Haruki and generated noisy false
+        # positives. Only documented/static aliases are forwarded.
         return False, False, True
-    return haruki, sakura, False
+    if REGIONAL_PREFIX_RE.match(check) and not (haruki or sakura):
+        return False, False, True
+    return False, False, False
 
 
 def _prepend_slash(raw_payload: str, pure_msg: str, cq_prefix: str) -> str:
-    if pure_msg.startswith("/"):
-        return raw_payload
     data = _loads(raw_payload)
-    data["raw_message"] = cq_prefix + "/" + pure_msg.lstrip()
+    command = pure_msg.strip()
+    if not command.startswith("/"):
+        command = "/" + command
+    data["raw_message"] = cq_prefix + command
     for seg in data.get("message", []):
         if isinstance(seg, dict) and seg.get("type") == "text":
             text = seg.get("data", {}).get("text", "")
             if text.strip():
-                seg["data"]["text"] = re.sub(r"^(\s*)", r"\1/", text, count=1)
+                leading = text[: len(text) - len(text.lstrip())]
+                content = text[len(leading):]
+                if not content.startswith("/"):
+                    content = "/" + content
+                seg["data"]["text"] = leading + content
                 break
     return _dumps(data)
 
@@ -332,35 +407,159 @@ def _register_route(target: ReplyTarget) -> None:
         _reply_routes[key] = target
 
 
-def _message_from_api(value: Any) -> Message:
+async def _download_remote_image(session: aiohttp.ClientSession, url: str) -> str | None:
+    """Download an HTTP(S) image and return a OneBot ``base64://`` file value."""
+
+    # 默认直连；如部署环境确实需要代理，可显式设置 PJSK_IMAGE_PROXY。
+    proxies = [_REMOTE_IMAGE_PROXY, _REMOTE_IMAGE_PROXY] if _REMOTE_IMAGE_PROXY else []
+    proxies.append(None)
+    for proxy in proxies:
+        try:
+            request_kwargs = {"allow_redirects": True}
+            if proxy:
+                request_kwargs["proxy"] = proxy
+            async with session.get(url, **request_kwargs) as response:
+                if response.status != 200:
+                    logger.warning(
+                        f"PJSK relay image download failed: status={response.status} "
+                        f"proxy={'set' if proxy else 'direct'} url={_url_label(url)}"
+                    )
+                    continue
+                content = bytearray()
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    content.extend(chunk)
+                    if len(content) > _REMOTE_IMAGE_MAX_BYTES:
+                        logger.warning(
+                            f"PJSK relay image download skipped: image too large url={_url_label(url)}"
+                        )
+                        return None
+                expected_size = getattr(response, "content_length", None)
+                if expected_size and len(content) != expected_size:
+                    logger.warning(
+                        f"PJSK relay image download incomplete: expected={expected_size} "
+                        f"actual={len(content)} proxy={'set' if proxy else 'direct'} "
+                        f"url={_url_label(url)}"
+                    )
+                    continue
+                logger.info(
+                    f"PJSK relay image materialized: bytes={len(content)} "
+                    f"proxy={'set' if proxy else 'direct'}"
+                )
+                return f"base64://{b64encode(bytes(content)).decode('ascii')}"
+        except Exception as exc:
+            logger.warning(
+                f"PJSK relay image download failed: {type(exc).__name__} "
+                f"proxy={'set' if proxy else 'direct'} url={_url_label(url)}"
+            )
+    return None
+
+
+async def _message_from_api(value: Any) -> Message:
     if isinstance(value, str):
-        return Message(value)
+        # Haruki may serialize the OneBot message as a CQ-code string instead
+        # of an array. Parse it first so image segments go through the same
+        # proxy download/base64 path as array-form messages.
+        parsed = Message(value)
+        return await _message_from_api([
+            {"type": segment.type, "data": dict(segment.data)}
+            for segment in parsed
+        ])
+    if isinstance(value, Message):
+        return await _message_from_api([
+            {"type": segment.type, "data": dict(segment.data)}
+            for segment in value
+        ])
     if isinstance(value, list):
         segments = []
-        for item in value:
-            if isinstance(item, dict) and item.get("type"):
-                segments.append(MessageSegment(type=item["type"], data=dict(item.get("data") or {})))
-            elif item is not None:
-                segments.append(MessageSegment.text(str(item)))
+        session: aiohttp.ClientSession | None = None
+        try:
+            for item in value:
+                if isinstance(item, dict) and item.get("type"):
+                    data = dict(item.get("data") or {})
+                    file_value = data.get("file")
+                    if (
+                        item["type"] == "image"
+                        and isinstance(file_value, str)
+                        and urlsplit(file_value).scheme in {"http", "https"}
+                    ):
+                        # Gensokyo/QQ may reuse an external URL's cached upload
+                        # across groups. That cache entry can be valid in the
+                        # first group but rejected in the next one, so force a
+                        # fresh upload for backend-generated images.
+                        data["cache"] = "false"
+                        if session is None:
+                            session = aiohttp.ClientSession(
+                                timeout=_REMOTE_IMAGE_TIMEOUT,
+                                headers={"User-Agent": WS_USER_AGENT},
+                            )
+                        encoded = await _download_remote_image(session, file_value)
+                        if encoded:
+                            data["file"] = encoded
+                    segments.append(MessageSegment(type=item["type"], data=data))
+                elif item is not None:
+                    segments.append(MessageSegment.text(str(item)))
+        finally:
+            if session is not None:
+                await session.close()
         return Message(segments)
     if isinstance(value, dict) and value.get("type"):
-        return Message([MessageSegment(type=value["type"], data=dict(value.get("data") or {}))])
+        return await _message_from_api([value])
     return Message(str(value or ""))
 
 
+def _escape_markdown_text(value: str) -> str:
+    return re.sub(r"([\\`*_\[\]{}()#+\-.!|>])", r"\\\1", value)
+
+
+def _linkify_markdown(value: str) -> str:
+    parts: list[str] = []
+    offset = 0
+    for match in _PLAIN_URL_RE.finditer(value):
+        parts.append(_escape_markdown_text(value[offset:match.start()]))
+        parts.append(f"[打开链接]({match.group(0)})")
+        offset = match.end()
+    parts.append(_escape_markdown_text(value[offset:]))
+    return "".join(parts)
+
+
+def _markdownize_plain_urls(message: Message, bot: Any) -> Message:
+    """Convert plain-text web links to QQ official-bot Markdown segments."""
+
+    if str(getattr(bot, "self_id", "")) not in _MARKDOWN_BOT_IDS:
+        return message
+    converted: list[MessageSegment] = []
+    changed = False
+    for segment in message:
+        if segment.type == "text":
+            text = str(segment.data.get("text", ""))
+            if _PLAIN_URL_RE.search(text):
+                md_data = {
+                    "markdown": {"content": _linkify_markdown(text)},
+                    "keyboard": {"content": {"rows": []}},
+                }
+                converted.append(MessageSegment(type="markdown", data={"data": md_data}))
+                changed = True
+                continue
+        converted.append(segment)
+    return Message(converted) if changed else message
+
+
 async def _deliver_backend_message(target: ReplyTarget, action: str, params: dict[str, Any]) -> dict[str, Any]:
-    message = _message_from_api(params.get("message", ""))
+    message = await _message_from_api(params.get("message", ""))
+    message = _markdownize_plain_urls(message, target.bot)
     group_id = params.get("group_id") or target.group_id
     user_id = params.get("user_id") or target.user_id
 
     if action in {"send_group_msg"} or (action == "send_msg" and group_id):
         if hasattr(target.bot, "send_group_msg"):
-            result = await target.bot.send_group_msg(group_id=int(group_id), message=message)
+            # Release010 may use non-numeric OpenID-like identifiers.  Keep the
+            # adapter value opaque instead of forcing an int conversion.
+            result = await target.bot.send_group_msg(group_id=group_id, message=message)
         else:
             result = await target.bot.send(target.event, message)
     elif action in {"send_private_msg", "send_private_msg_wakeup"} or (action == "send_msg" and user_id):
         if hasattr(target.bot, "send_private_msg"):
-            result = await target.bot.send_private_msg(user_id=int(user_id), message=message)
+            result = await target.bot.send_private_msg(user_id=user_id, message=message)
         else:
             result = await target.bot.send(target.event, message)
     else:

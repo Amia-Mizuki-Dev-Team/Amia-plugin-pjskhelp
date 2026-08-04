@@ -7,7 +7,17 @@ from nonebot.adapters.onebot.v11 import Bot, MessageEvent, MessageSegment, Messa
 from .builder import build_pjsk_markdown
 from .render import get_mizuki_help_image
 from .data_source import HELP_MD_MENUS, HELP_IMG_DATA, HELP_PAGE_ORDER
-from .proxy_core import PJSK_RELAY_ENABLED, _route_for, dispatch_message, start_gateway, stop_gateway
+from .proxy_core import (
+    HARUKI_CMDS,
+    PJSK_RELAY_ENABLED,
+    SAKURA_CMDS,
+    SHARED_CMDS,
+    _route_for,
+    dispatch_message,
+    start_gateway,
+    stop_gateway,
+)
+from src.plugins.amia_core.release010 import HXCodeError, send_error_with_diagnostic
 
 
 @get_driver().on_startup
@@ -49,11 +59,18 @@ PAGE_KEY_TO_CN = {
     "misc_1": "杂项", "misc_2": "杂项",
 }
 
-pjsk_help = on_regex(r"^[/\s]*(?:cn|tw|kr|en|jp)?pjsk(?:help|帮助)\s*(.*)", flags=re.IGNORECASE, priority=5, block=True)
+_CQ_AT_PREFIX = r"(?:\[CQ:at,[^\]]+\]\s*)*"
+
+pjsk_help = on_regex(
+    rf"^[/\s]*{_CQ_AT_PREFIX}(?:cn|tw|kr|en|jp)?pjsk(?:help|帮助)\s*(.*)",
+    flags=re.IGNORECASE,
+    priority=5,
+    block=True,
+)
 
 # 吃掉 pjsk表情制作 / pjsk -h 等不应被后端响应的指令
 _pjsk_block = on_regex(
-    r"^[/\s]*(?:cn|tw|kr|en|jp)?\s*pjsk\s*(?:表情制作|-h)",
+    rf"^[/\s]*{_CQ_AT_PREFIX}(?:cn|tw|kr|en|jp)?\s*pjsk\s*(?:表情制作|-h)",
     flags=re.IGNORECASE, priority=4, block=True
 )
 
@@ -73,7 +90,7 @@ def _is_pjsk_backend_message(event: MessageEvent) -> bool:
 # Help/local-only matchers use higher priority; this matcher only handles the
 # remaining PJSK command family and never opens the former 8113 ingress socket.
 pjsk_backend_relay = on_regex(
-    r"^[/\s]*(?:cn|tw|kr|en|jp)?\s*pjsk\S*(?:\s+.*)?$",
+    rf"^[/\s]*{_CQ_AT_PREFIX}(?:cn|tw|kr|en|jp)?\s*pjsk\S*(?:\s+.*)?$",
     flags=re.IGNORECASE,
     priority=6,
     block=True,
@@ -85,7 +102,24 @@ pjsk_backend_relay = on_regex(
 # Keep it limited to explicit regional prefixes so ordinary local commands
 # such as ``个人信息`` remain untouched.
 haruki_regional_relay = on_regex(
-    r"^[/\s]*(?:cn|tw|kr|en|jp)(?!pjsk)\s*[^\s/].*",
+    rf"^[/\s]*{_CQ_AT_PREFIX}(?:cn|tw|kr|en|jp)(?!pjsk)\s*[^\s/].*",
+    flags=re.IGNORECASE,
+    priority=6,
+    block=True,
+)
+
+# Help buttons and older PJSK usage examples often omit both ``/`` and the
+# regional prefix. Build this matcher from the routing table so newly added
+# aliases do not need another hand-maintained regex. Regional and pjsk-prefixed
+# forms continue to use the matchers above.
+_PLAIN_PJSK_COMMANDS = sorted(
+    {command for command in HARUKI_CMDS | SAKURA_CMDS | SHARED_CMDS if command},
+    key=len,
+    reverse=True,
+)
+_PLAIN_PJSK_COMMAND_RE = "|".join(re.escape(command) for command in _PLAIN_PJSK_COMMANDS)
+pjsk_plain_backend_relay = on_regex(
+    rf"^[/\s]*{_CQ_AT_PREFIX}(?:{_PLAIN_PJSK_COMMAND_RE})(?:\s+.*)?$",
     flags=re.IGNORECASE,
     priority=6,
     block=True,
@@ -95,7 +129,13 @@ haruki_regional_relay = on_regex(
 async def _relay_pjsk_command(matcher, bot: Bot, event: MessageEvent):
     result = await dispatch_message(bot, event)
     if result.get("matched") and not result.get("sent"):
-        await matcher.finish("PJSK 后端暂未连接，请稍后重试。")
+        error = HXCodeError(
+            "HX-PJSK-002",
+            "PJSK 后端暂时没有连接。",
+            "请稍后重试；如果连续失败，请提交诊断日志。",
+            "Haruki/Sakura 的反向 WebSocket 当前没有可用连接。",
+        )
+        await send_error_with_diagnostic(matcher, error, "PJSK", context="relay")
 
 
 @pjsk_backend_relay.handle()
@@ -106,6 +146,11 @@ async def _relay_pjsk_command_with_prefix(bot: Bot, event: MessageEvent):
 @haruki_regional_relay.handle()
 async def _relay_haruki_regional_command(bot: Bot, event: MessageEvent):
     await _relay_pjsk_command(haruki_regional_relay, bot, event)
+
+
+@pjsk_plain_backend_relay.handle()
+async def _relay_pjsk_plain_command(bot: Bot, event: MessageEvent):
+    await _relay_pjsk_command(pjsk_plain_backend_relay, bot, event)
 
 
 @_pjsk_block.handle()
@@ -160,4 +205,4 @@ async def handle_pjsk_help(bot: Bot, event: MessageEvent):
             # 关键修复：放行 Nonebot 的正常结束流
             raise
         except Exception as e:
-            await pjsk_help.finish(f"渲染帮助图片失败: {str(e)}")
+            await send_error_with_diagnostic(pjsk_help, e, "PJSK", context="help-render")
