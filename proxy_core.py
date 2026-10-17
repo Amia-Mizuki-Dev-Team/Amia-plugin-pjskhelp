@@ -32,8 +32,10 @@ except Exception:  # pragma: no cover
 try:
     _qbind = require("qbind")
     get_real_qq = _qbind.get_real_qq
+    get_real_group = _qbind.get_real_group
+    ensure_context_bound = _qbind.ensure_context_bound
 except Exception:  # pragma: no cover
-    get_real_qq = None
+    get_real_qq = get_real_group = ensure_context_bound = None
 
 
 def _u(value: str) -> str:
@@ -60,10 +62,56 @@ def _env_bool(name: str, default: bool = True) -> bool:
 
 
 PJSK_RELAY_ENABLED = _env_bool("PJSK_RELAY_ENABLED", True)
-HARUKI_WS_URL = os.getenv("HARUKI_WS_URL", "ws://127.0.0.1:8111")
+PJSK_LOCAL_GUESS_ENABLED = _env_bool("PJSK_LOCAL_GUESS_ENABLED", True)
+
+
+def _haruki_ws_url(value: str) -> str:
+    """Return the fixed Haruki reverse-WS route for the local deployment.
+
+    Older private ``.env`` files used the TCP root (``:8111``).  Keeping that
+    value would make the connector establish the wrong HTTP route and then
+    retry forever.  Normalize only the known local Haruki listener; custom
+    operator-controlled wrappers keep their explicit path unchanged.
+    """
+
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme in {"ws", "wss"}
+        and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+        and parsed.port == 8111
+        and parsed.path in {"", "/"}
+        and not parsed.query
+        and not parsed.fragment
+    ):
+        return value.rstrip("/") + "/ws"
+    return value
+
+
+# Haruki's OneBot reverse WebSocket is exposed at the fixed ``/ws`` path.
+# Keep the environment override for deployments that wrap it, but do not make
+# the default point at the TCP root: the Haruki client accepts the connection
+# there only as an HTTP/WebSocket route mismatch and never delivers replies.
+HARUKI_WS_URL = _haruki_ws_url(os.getenv("HARUKI_WS_URL", "ws://127.0.0.1:8111/ws"))
 SAKURA_WS_URL = os.getenv("SAKURA_WS_URL", "ws://101.34.19.31:13888/onebot/v11/ws")
 HARUKI_TOKEN = os.getenv("HARUKI_TOKEN", "")
 SAKURA_TOKEN = os.getenv("SAKURA_TOKEN", "")
+
+
+def _auth_scheme(name: str, default: str) -> str:
+    """Normalize the operator-selected OneBot reverse-WS auth scheme."""
+
+    raw = os.getenv(name, default).strip().lower()
+    if raw == "token":
+        return "Token"
+    if raw == "bearer":
+        return "Bearer"
+    # Keep an invalid environment value from breaking plugin import. The
+    # selected default is safe and this value never comes from a user message.
+    return default
+
+
+HARUKI_AUTH_SCHEME = _auth_scheme("HARUKI_AUTH_SCHEME", "Bearer")
+SAKURA_AUTH_SCHEME = _auth_scheme("SAKURA_AUTH_SCHEME", "Token")
 
 # A reverse-WS client must identify itself consistently.  The old gateway
 # selected a random ID on every reconnect, which is rejected by strict
@@ -103,6 +151,10 @@ SHARED_CMDS = {
     _u(r"\u6700\u5f3a\u7ec4\u5361"), _u(r"\u5bb6\u5177\u5217\u8868"),
     _u(r"mysekai\u7167\u7247"),
 }
+
+# Binding is a write-capable command exposed by both PJSK backends.  It must
+# be dispatched to both instead of being treated as a single-backend fallback.
+BINDING_DUAL_CMDS = {_u(r"\u7ed1\u5b9a")}
 
 HARUKI_CMDS = {
     "bind", "profile", "set main", "unbind", "hide suite", "show suite", "hide mysekai",
@@ -154,6 +206,13 @@ SAKURA_CMDS = {
     _u(r"\u5173\u95edlive\u63a8\u9001"), _u(r"\u5173\u95edlive\u901a\u77e5"),
 }
 
+LOCAL_GUESS_CMDS = {
+    _u(r"\u731c\u6b4c"), _u(r"\u731c\u66f2\u7ed8"), _u(r"\u731c\u5361\u9762"),
+    _u(r"\u731c\u8c31\u9762"), _u(r"\u968f\u673a\u6311\u6218"),
+    _u(r"\u542c\u6b4c\u8bc6\u66f2"), _u(r"\u7ed3\u675f\u731c\u66f2"),
+    _u(r"\u7ed3\u675f\u731c\u5361\u9762"), _u(r"\u7ed3\u675f\u731c\u9898"),
+}
+
 
 def _load_documented_haruki_commands() -> set[str]:
     """Load the generated Haruki NEO command catalog without network access."""
@@ -193,10 +252,13 @@ class ReplyTarget:
     event: Any
     user_id: str
     group_id: str | None
+    real_user_id: str | None = None
+    real_group_id: str | None = None
 
 
 _backend_ws: dict[str, Any] = {"haruki": None, "sakura": None}
-_reply_routes: dict[str, ReplyTarget] = {}
+_backend_state: dict[str, str] = {"haruki": "BACKOFF", "sakura": "BACKOFF"}
+_reply_routes: dict[tuple[str, str], ReplyTarget] = {}
 _tasks: list[asyncio.Task] = []
 _heartbeat_tasks: set[asyncio.Task] = set()
 _message_cache: dict[str, float] = {}
@@ -231,7 +293,14 @@ def _headers(self_id: str, token: str = "") -> dict[str, str]:
         "X-Impl": WS_IMPL,
     }
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        # Sakura's OneBot reverse-WS reference client uses Token auth. Keep
+        # Haruki's historical Bearer default; both are operator-configurable.
+        scheme = (
+            SAKURA_AUTH_SCHEME
+            if str(self_id) == str(SAKURA_BOT_ID)
+            else HARUKI_AUTH_SCHEME
+        )
+        headers["Authorization"] = f"{scheme} {token}"
     return headers
 
 
@@ -309,6 +378,8 @@ def _match_command(text: str, commands: set[str]) -> bool:
 
 def _route_for(text: str) -> tuple[bool, bool, bool]:
     check = text.lstrip("/")
+    if PJSK_LOCAL_GUESS_ENABLED and _match_command(check, LOCAL_GUESS_CMDS):
+        return False, False, True
     if any(pattern.match(check) for pattern in LOCAL_ONLY_RE):
         return False, False, True
     if COMPACT_B39_RE.match(check):
@@ -321,12 +392,15 @@ def _route_for(text: str) -> tuple[bool, bool, bool]:
         return False, True, False
 
     documented_haruki = _match_command(check, HARUKI_DOCUMENTED_CMDS)
+    binding_dual = _match_command(check, BINDING_DUAL_CMDS)
     shared = _match_command(check, SHARED_CMDS)
     haruki = _match_command(check, HARUKI_CMDS)
     sakura = _match_command(check, SAKURA_CMDS)
 
     # Prefer the current Haruki NEO documentation when an alias exists on both
     # services. Sakura receives only its legacy/specialized command surface.
+    if binding_dual:
+        return True, True, False
     if documented_haruki:
         return True, False, False
     if sakura:
@@ -361,15 +435,43 @@ def _prepend_slash(raw_payload: str, pure_msg: str, cq_prefix: str) -> str:
     return _dumps(data)
 
 
-def _rewrite_for_sakura(raw_payload: str, virtual_user_id: Any) -> str:
+def _id_with_original_type(original: Any, replacement: str) -> Any:
+    if isinstance(original, int) and not isinstance(original, bool) and replacement.isdigit():
+        return int(replacement)
+    return replacement
+
+
+def _rewrite_backend_identity(
+    raw_payload: str, bot_scope: str, *, backend_self_id: Any = None
+) -> str:
     data = _loads(raw_payload)
-    data["self_id"] = int(SAKURA_BOT_ID)
-    real_qq = str(get_real_qq(str(virtual_user_id))) if get_real_qq else str(virtual_user_id)
-    if real_qq.isdigit():
-        data["user_id"] = int(real_qq)
-        if isinstance(data.get("sender"), dict):
-            data["sender"]["user_id"] = int(real_qq)
+    if backend_self_id is not None:
+        data["self_id"] = backend_self_id
+
+    if get_real_qq and data.get("user_id") is not None:
+        real_user_id = get_real_qq(str(data["user_id"]), bot_scope)
+        if real_user_id is not None:
+            real_user_id = str(real_user_id)
+            if real_user_id.isdigit():
+                data["user_id"] = _id_with_original_type(data["user_id"], real_user_id)
+                if isinstance(data.get("sender"), dict) and data["sender"].get("user_id") is not None:
+                    data["sender"]["user_id"] = _id_with_original_type(
+                        data["sender"]["user_id"], real_user_id
+                    )
+
+    if get_real_group and data.get("group_id") is not None:
+        real_group_id = get_real_group(str(data["group_id"]), bot_scope)
+        if real_group_id is not None:
+            real_group_id = str(real_group_id)
+            if real_group_id.isdigit():
+                data["group_id"] = _id_with_original_type(data["group_id"], real_group_id)
     return _dumps(data)
+
+
+def _rewrite_for_sakura(raw_payload: str, bot_scope: str) -> str:
+    return _rewrite_backend_identity(
+        raw_payload, bot_scope, backend_self_id=int(SAKURA_BOT_ID)
+    )
 
 
 def _event_payload(event: Any) -> str:
@@ -391,20 +493,39 @@ def _event_group_id(event: Any) -> str | None:
     return str(group_id) if group_id else None
 
 
-def _route_keys(user_id: str, group_id: str | None) -> list[str]:
+def _identity_log_value(value: Any) -> str:
+    """Keep opaque identity values safe for one-line audit logs."""
+
+    if value is None or value == "":
+        return "-"
+    return str(value).replace("\r", "\\r").replace("\n", "\\n")[:160]
+
+
+def _route_keys(
+    user_id: str,
+    group_id: str | None,
+    real_user_id: str | None = None,
+    real_group_id: str | None = None,
+) -> list[str]:
     keys = [f"user_{user_id}"]
-    if get_real_qq:
-        real = get_real_qq(user_id)
-        if real and str(real) != user_id:
-            keys.append(f"user_{real}")
+    if real_user_id and real_user_id != user_id:
+        keys.append(f"user_{real_user_id}")
     if group_id:
         keys.insert(0, f"group_{group_id}")
+    if real_group_id and real_group_id != group_id:
+        keys.insert(0, f"group_{real_group_id}")
     return keys
 
 
-def _register_route(target: ReplyTarget) -> None:
-    for key in _route_keys(target.user_id, target.group_id):
-        _reply_routes[key] = target
+def _register_route(target: ReplyTarget, backends: list[str]) -> None:
+    for backend in backends:
+        for key in _route_keys(
+            target.user_id,
+            target.group_id,
+            target.real_user_id,
+            target.real_group_id,
+        ):
+            _reply_routes[(backend, key)] = target
 
 
 async def _download_remote_image(session: aiohttp.ClientSession, url: str) -> str | None:
@@ -547,8 +668,10 @@ def _markdownize_plain_urls(message: Message, bot: Any) -> Message:
 async def _deliver_backend_message(target: ReplyTarget, action: str, params: dict[str, Any]) -> dict[str, Any]:
     message = await _message_from_api(params.get("message", ""))
     message = _markdownize_plain_urls(message, target.bot)
-    group_id = params.get("group_id") or target.group_id
-    user_id = params.get("user_id") or target.user_id
+    original_group_id = getattr(target.event, "group_id", target.group_id)
+    original_user_id = getattr(target.event, "user_id", target.user_id)
+    group_id = original_group_id if original_group_id is not None else params.get("group_id")
+    user_id = original_user_id if original_user_id is not None else params.get("user_id")
 
     if action in {"send_group_msg"} or (action == "send_msg" and group_id):
         if hasattr(target.bot, "send_group_msg"):
@@ -592,8 +715,10 @@ async def _process_backend_api(message: str, source: str, source_ws: Any) -> Non
             params = data.get("params") or {}
             gid = params.get("group_id")
             uid = params.get("user_id")
-            target = _reply_routes.get(f"group_{gid}") if gid else None
-            target = target or (_reply_routes.get(f"user_{uid}") if uid else None)
+            target = _reply_routes.get((source, f"group_{gid}")) if gid else None
+            target = target or (
+                _reply_routes.get((source, f"user_{uid}")) if uid else None
+            )
             if target:
                 result = await _deliver_backend_message(target, action, params)
                 await _ws_send(source_ws, _dumps({"status": "ok", "retcode": 0, "data": result, "echo": echo}))
@@ -610,8 +735,10 @@ async def _process_backend_api(message: str, source: str, source_ws: Any) -> Non
 async def _maintain_backend(name: str, url: str, token: str, self_id: str) -> None:
     fail_count = 0
     while True:
+        _backend_state[name] = "CONNECTING"
         cancelled = False
         heartbeat_task: asyncio.Task | None = None
+        disabled = False
         try:
             logger.info(
                 "PJSK backend connecting: "
@@ -622,6 +749,7 @@ async def _maintain_backend(name: str, url: str, token: str, self_id: str) -> No
                 async with session.ws_connect(url, headers=_headers(self_id, token), timeout=15) as ws:
                     _backend_ws[name] = ws
                     fail_count = 0
+                    _backend_state[name] = "CONNECTED"
                     logger.info(f"PJSK backend connected: backend={name} endpoint={_url_label(url)} self_id={self_id}")
                     await _mock_lifecycle(ws, self_id)
                     heartbeat_task = asyncio.create_task(_mock_heartbeat(ws, self_id))
@@ -641,14 +769,24 @@ async def _maintain_backend(name: str, url: str, token: str, self_id: str) -> No
                 f"PJSK backend disconnected: backend={name} endpoint={_url_label(url)} "
                 f"reason={_classify_connection_error(exc)}"
             )
+            if name == "sakura" and fail_count >= 3:
+                disabled = True
+                _backend_state[name] = "DISABLED"
+                logger.error(
+                    "PJSK backend disabled: backend=sakura state=DISABLED "
+                    "reason=3_consecutive_failures restart_required=true"
+                )
         finally:
             _backend_ws[name] = None
             if heartbeat_task:
                 heartbeat_task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
                     await heartbeat_task
-            if not cancelled:
+            if not cancelled and not disabled:
+                _backend_state[name] = "BACKOFF"
                 await asyncio.sleep(_backoff(fail_count))
+        if disabled:
+            return
 
 
 async def dispatch_message(bot: Any, event: Any) -> dict[str, Any]:
@@ -665,12 +803,55 @@ async def dispatch_message(bot: Any, event: Any) -> dict[str, Any]:
     if blocked or not (haruki or sakura):
         return {"matched": False, "blocked": blocked, "sent": []}
 
+    scope_value = getattr(bot, "self_id", None) or getattr(event, "self_id", None)
+    scope = str(scope_value).strip() if scope_value is not None else ""
+    if not scope or not callable(ensure_context_bound):
+        logger.error("PJSK relay blocked: QBind identity gate is unavailable")
+        return {
+            "matched": True,
+            "blocked": True,
+            "reason": "identity_provider_unavailable",
+            "sent": [],
+        }
+
+    try:
+        if not await ensure_context_bound(event, bot):
+            return {
+                "matched": True,
+                "blocked": True,
+                "reason": "identity_unbound",
+                "sent": [],
+            }
+        user_id = _event_user_id(event)
+        group_id = _event_group_id(event)
+        real_user_id = get_real_qq(user_id, scope) if get_real_qq else None
+        real_group_id = (
+            get_real_group(group_id, scope)
+            if group_id is not None and get_real_group
+            else None
+        )
+    except Exception:
+        logger.exception("PJSK relay blocked: QBind identity resolution failed")
+        return {
+            "matched": True,
+            "blocked": True,
+            "reason": "identity_resolution_failed",
+            "sent": [],
+        }
+
+    if real_user_id is None or (group_id is not None and real_group_id is None):
+        logger.error("PJSK relay blocked: bound identity could not be resolved")
+        return {
+            "matched": True,
+            "blocked": True,
+            "reason": "identity_resolution_failed",
+            "sent": [],
+        }
+
     logger.info(
         f"PJSK relay routing command={raw_msg!r} haruki={haruki} sakura={sakura}"
     )
 
-    user_id = _event_user_id(event)
-    group_id = _event_group_id(event)
     cache_key = f"{group_id or 0}:{user_id}:{raw_msg}"
     now = time.time()
     for key, seen in list(_message_cache.items()):
@@ -680,17 +861,40 @@ async def dispatch_message(bot: Any, event: Any) -> dict[str, Any]:
         return {"matched": True, "blocked": False, "sent": []}
     _message_cache[cache_key] = now
 
-    target = ReplyTarget(bot=bot, event=event, user_id=user_id, group_id=group_id)
-    _register_route(target)
+    target = ReplyTarget(
+        bot=bot,
+        event=event,
+        user_id=user_id,
+        group_id=group_id,
+        real_user_id=str(real_user_id),
+        real_group_id=str(real_group_id) if real_group_id is not None else None,
+    )
+    available_backends = [
+        name
+        for name, selected in (("sakura", sakura), ("haruki", haruki))
+        if selected and _backend_ws[name]
+    ]
+    logger.info(
+        "PJSK identity audit: "
+        f"bot={_identity_log_value(scope)} "
+        f"virtual_user={_identity_log_value(user_id)} "
+        f"real_user={_identity_log_value(real_user_id)} "
+        f"virtual_group={_identity_log_value(group_id)} "
+        f"real_group={_identity_log_value(real_group_id)} "
+        f"backends={','.join(available_backends) or '-'}"
+    )
+    _register_route(target, available_backends)
     raw_payload = _event_payload(event)
     sent: list[str] = []
     if sakura and _backend_ws["sakura"]:
-        await _ws_send(_backend_ws["sakura"], _rewrite_for_sakura(raw_payload, user_id))
+        await _ws_send(_backend_ws["sakura"], _rewrite_for_sakura(raw_payload, scope))
         sent.append("sakura")
     if haruki and _backend_ws["haruki"]:
         match = re.match(r"^(\s*(?:\[CQ:[^\]]+\]\s*)*)(.*)$", raw_msg)
         cq_prefix, pure_msg = (match.group(1), match.group(2)) if match else ("", raw_msg)
-        await _ws_send(_backend_ws["haruki"], _prepend_slash(raw_payload, pure_msg, cq_prefix))
+        haruki_payload = _prepend_slash(raw_payload, pure_msg, cq_prefix)
+        haruki_payload = _rewrite_backend_identity(haruki_payload, scope)
+        await _ws_send(_backend_ws["haruki"], haruki_payload)
         sent.append("haruki")
     logger.info(f"PJSK relay dispatched command={raw_msg!r} backends={sent}")
     return {"matched": True, "blocked": False, "sent": sent}
@@ -722,3 +926,4 @@ async def stop_gateway() -> None:
     _heartbeat_tasks.clear()
     _reply_routes.clear()
     _message_cache.clear()
+

@@ -7,6 +7,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import nonebot
 import aiohttp
@@ -20,7 +21,27 @@ SPEC = importlib.util.spec_from_file_location("pjsk_proxy_core_test", MODULE_PAT
 assert SPEC and SPEC.loader
 proxy = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = proxy
-nonebot.require = lambda _name: SimpleNamespace(get_real_qq=lambda value: None)
+
+IDENTITY_MAP: dict[tuple[str, str, str], str] = {}
+
+
+def fake_get_real_qq(user_id, self_id=None):
+    return IDENTITY_MAP.get((str(self_id), "user", str(user_id)), str(user_id))
+
+
+def fake_get_real_group(group_id, self_id=None):
+    return IDENTITY_MAP.get((str(self_id), "group", str(group_id)), str(group_id))
+
+
+async def fake_ensure_context_bound(_event, _bot):
+    return True
+
+
+nonebot.require = lambda _name: SimpleNamespace(
+    get_real_qq=fake_get_real_qq,
+    get_real_group=fake_get_real_group,
+    ensure_context_bound=fake_ensure_context_bound,
+)
 SPEC.loader.exec_module(proxy)
 
 
@@ -65,6 +86,7 @@ class FakeEvent:
             "user_id": self.user_id,
             "group_id": self.group_id,
             "message_type": "group",
+            "sender": {"user_id": self.user_id, "role": "member"},
             "message": [{"type": "text", "data": {"text": self.command}}],
             "original_message": [{"type": "text", "data": {"text": self.command}}],
             "raw_message": self.command,
@@ -73,6 +95,8 @@ class FakeEvent:
 
 class TestProxyCore(unittest.TestCase):
     def tearDown(self) -> None:
+        IDENTITY_MAP.clear()
+        proxy.ensure_context_bound = fake_ensure_context_bound
         proxy._backend_ws["haruki"] = None
         proxy._backend_ws["sakura"] = None
         proxy._reply_routes.clear()
@@ -81,6 +105,9 @@ class TestProxyCore(unittest.TestCase):
     def test_route_aliases_and_local_filters(self) -> None:
         self.assertEqual(proxy._route_for("pjsk b30")[:2], (False, True))
         self.assertEqual(proxy._route_for("cnpjsk b30")[:2], (False, True))
+        self.assertEqual(proxy._route_for("绑定 123456789"), (True, True, False))
+        self.assertEqual(proxy._route_for("/cn绑定 123456789"), (True, True, False))
+        self.assertEqual(proxy._route_for("/twpjsk绑定 123456789"), (True, True, False))
         self.assertEqual(proxy._route_for("pjskb39"), (False, True, False))
         self.assertEqual(proxy._route_for("cnpjskb39"), (False, True, False))
         self.assertEqual(proxy._route_for("pjsk b39"), (False, False, True))
@@ -147,12 +174,18 @@ class TestProxyCore(unittest.TestCase):
         self.assertEqual(first["X-Self-ID"], "3889004352")
         self.assertEqual(first["X-Client-Role"], "Universal")
         self.assertNotIn("Authorization", first)
+        self.assertEqual(proxy._headers("3889004352", "secret")["Authorization"], "Token secret")
         self.assertEqual(proxy._headers("1", "secret")["Authorization"], "Bearer secret")
+
+    def test_haruki_default_reverse_ws_uses_fixed_ws_path(self) -> None:
+        self.assertEqual(proxy.HARUKI_WS_URL, "ws://127.0.0.1:8111/ws")
+        self.assertEqual(proxy._haruki_ws_url("ws://127.0.0.1:8111"), "ws://127.0.0.1:8111/ws")
+        self.assertEqual(proxy._haruki_ws_url("ws://10.0.0.40:8111"), "ws://10.0.0.40:8111")
 
     def test_sakura_rewrite_always_uses_stable_bot_identity(self) -> None:
         payload = proxy._rewrite_for_sakura(
             json.dumps({"post_type": "message", "self_id": 9, "user_id": 123, "sender": {"user_id": 123}}),
-            123,
+            "bot-a",
         )
         data = json.loads(payload)
         self.assertEqual(data["self_id"], int(proxy.SAKURA_BOT_ID))
@@ -168,6 +201,117 @@ class TestProxyCore(unittest.TestCase):
         self.assertEqual(len(haruki.sent), 0)
         self.assertEqual(len(sakura.sent), 1)
         self.assertEqual(json.loads(sakura.sent[0])["self_id"], int(proxy.SAKURA_BOT_ID))
+
+    def test_relay_sends_scoped_qbind_ids_to_haruki_and_routes_reply_back_to_virtual_group(self) -> None:
+        IDENTITY_MAP[(str(FakeBot.self_id), "user", "123")] = "2338680148"
+        IDENTITY_MAP[(str(FakeBot.self_id), "group", "456")] = "1130393781"
+        haruki = FakeWS()
+        proxy._backend_ws["haruki"] = haruki
+        bot = FakeBot()
+
+        with patch.object(proxy.logger, "info") as info:
+            result = asyncio.run(
+                proxy.dispatch_message(bot, FakeEvent("cn个人信息"))
+            )
+
+        self.assertEqual(result["sent"], ["haruki"])
+        audit_messages = [str(call.args[0]) for call in info.call_args_list]
+        self.assertTrue(
+            any(
+                "PJSK identity audit:" in message
+                and "virtual_user=123" in message
+                and "real_user=2338680148" in message
+                and "virtual_group=456" in message
+                and "real_group=1130393781" in message
+                and "backends=haruki" in message
+                for message in audit_messages
+            )
+        )
+        payload = json.loads(haruki.sent[0])
+        self.assertEqual(payload["user_id"], 2338680148)
+        self.assertEqual(payload["sender"]["user_id"], 2338680148)
+        self.assertEqual(payload["group_id"], 1130393781)
+        self.assertEqual(payload["raw_message"], "/cn个人信息")
+        self.assertIn(("haruki", "group_1130393781"), proxy._reply_routes)
+
+        backend = FakeWS()
+        asyncio.run(proxy._process_backend_api(
+            json.dumps({
+                "action": "send_group_msg",
+                "params": {
+                    "group_id": 1130393781,
+                    "message": [{"type": "text", "data": {"text": "ok"}}],
+                },
+                "echo": "canonical-group-reply",
+            }),
+            "haruki",
+            backend,
+        ))
+        self.assertEqual(bot.sent[0][0], 456)
+        self.assertEqual(json.loads(backend.sent[0])["retcode"], 0)
+
+        asyncio.run(proxy._process_backend_api(
+            json.dumps({
+                "action": "send_private_msg",
+                "params": {
+                    "user_id": 2338680148,
+                    "message": [{"type": "text", "data": {"text": "private"}}],
+                },
+                "echo": "canonical-user-reply",
+            }),
+            "haruki",
+            backend,
+        ))
+        self.assertEqual(bot.private_sent[0][0], 123)
+        self.assertEqual(json.loads(backend.sent[1])["retcode"], 0)
+
+    def test_unbound_command_is_not_forwarded_to_backend(self) -> None:
+        async def deny(_event, _bot):
+            return False
+
+        proxy.ensure_context_bound = deny
+        haruki = FakeWS()
+        proxy._backend_ws["haruki"] = haruki
+
+        result = asyncio.run(
+            proxy.dispatch_message(FakeBot(), FakeEvent("cn个人信息"))
+        )
+
+        self.assertTrue(result["blocked"])
+        self.assertEqual(result["reason"], "identity_unbound")
+        self.assertEqual(haruki.sent, [])
+
+    def test_relay_fails_closed_when_canonical_mapping_cannot_be_resolved(self) -> None:
+        for resolver_name in ("get_real_qq", "get_real_group"):
+            with self.subTest(resolver=resolver_name):
+                original_resolver = getattr(proxy, resolver_name)
+                setattr(proxy, resolver_name, lambda *_args, **_kwargs: None)
+                haruki = FakeWS()
+                proxy._backend_ws["haruki"] = haruki
+                try:
+                    result = asyncio.run(
+                        proxy.dispatch_message(FakeBot(), FakeEvent("cn个人信息"))
+                    )
+                finally:
+                    setattr(proxy, resolver_name, original_resolver)
+
+                self.assertTrue(result["blocked"])
+                self.assertEqual(result["reason"], "identity_resolution_failed")
+                self.assertEqual(haruki.sent, [])
+
+    def test_binding_dispatches_to_both_backends(self) -> None:
+        haruki = FakeWS()
+        sakura = FakeWS()
+        proxy._backend_ws["haruki"] = haruki
+        proxy._backend_ws["sakura"] = sakura
+
+        result = asyncio.run(proxy.dispatch_message(FakeBot(), FakeEvent("/cn绑定 123456789")))
+
+        self.assertEqual(result["sent"], ["sakura", "haruki"])
+        self.assertEqual(len(sakura.sent), 1)
+        self.assertEqual(len(haruki.sent), 1)
+        self.assertEqual(json.loads(sakura.sent[0])["raw_message"], "/cn绑定 123456789")
+        self.assertEqual(json.loads(haruki.sent[0])["raw_message"], "/cn绑定 123456789")
 
     def test_haruki_regional_commands_always_receive_slash(self) -> None:
         command = "cn\u4e2a\u4eba\u4fe1\u606f"
@@ -203,7 +347,7 @@ class TestProxyCore(unittest.TestCase):
     def test_backend_send_api_returns_to_original_group(self) -> None:
         bot = FakeBot()
         target = proxy.ReplyTarget(bot=bot, event=FakeEvent(), user_id="123", group_id="456")
-        proxy._reply_routes["group_456"] = target
+        proxy._reply_routes[("sakura", "group_456")] = target
         backend = FakeWS()
         asyncio.run(proxy._process_backend_api(
             json.dumps({
@@ -221,7 +365,7 @@ class TestProxyCore(unittest.TestCase):
     def test_plain_web_urls_are_markdownized_for_official_bots(self) -> None:
         bot = FakeBot()
         target = proxy.ReplyTarget(bot=bot, event=FakeEvent(), user_id="123", group_id="456")
-        proxy._reply_routes["group_456"] = target
+        proxy._reply_routes[("sakura", "group_456")] = target
         backend = FakeWS()
         asyncio.run(proxy._process_backend_api(
             json.dumps({
@@ -286,7 +430,7 @@ class TestProxyCore(unittest.TestCase):
     def test_backend_private_wakeup_preserves_media_segments(self) -> None:
         bot = FakeBot()
         target = proxy.ReplyTarget(bot=bot, event=FakeEvent(), user_id="123", group_id=None)
-        proxy._reply_routes["user_123"] = target
+        proxy._reply_routes[("haruki", "user_123")] = target
         backend = FakeWS()
         asyncio.run(proxy._process_backend_api(
             json.dumps({
@@ -315,11 +459,11 @@ class TestProxyCore(unittest.TestCase):
         bot = FakeBot()
         target = proxy.ReplyTarget(
             bot=bot,
-            event=FakeEvent(),
+            event=SimpleNamespace(group_id=None, user_id="openid-test-user"),
             user_id="openid-test-user",
             group_id=None,
         )
-        proxy._reply_routes["user_openid-test-user"] = target
+        proxy._reply_routes[("haruki", "user_openid-test-user")] = target
         backend = FakeWS()
         asyncio.run(proxy._process_backend_api(
             json.dumps({
@@ -375,3 +519,4 @@ class TestProxyCore(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
