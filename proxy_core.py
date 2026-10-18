@@ -31,11 +31,14 @@ except Exception:  # pragma: no cover
 
 try:
     _qbind = require("qbind")
-    get_real_qq = _qbind.get_real_qq
-    get_real_group = _qbind.get_real_group
-    ensure_context_bound = _qbind.ensure_context_bound
+    get_real_qq = getattr(_qbind, "get_real_qq", None)
+    _qbind_group = getattr(_qbind, "group", None)
+    get_real_group = getattr(_qbind_group, "get_real_group", None)
+    if get_real_group is None:
+        get_real_group = getattr(_qbind, "get_real_group", None)
 except Exception:  # pragma: no cover
-    get_real_qq = get_real_group = ensure_context_bound = None
+    get_real_qq = None
+    get_real_group = None
 
 
 def _u(value: str) -> str:
@@ -61,57 +64,27 @@ def _env_bool(name: str, default: bool = True) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off", "disabled"}
 
 
+def _normalize_haruki_ws_url(value: str) -> str:
+    """Use Haruki Client's reverse-WebSocket endpoint when no path is given."""
+
+    raw = value.strip()
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw
+    if parsed.scheme.lower() in {"ws", "wss"} and parsed.path in {"", "/"}:
+        return parsed._replace(path="/ws").geturl()
+    return raw
+
+
 PJSK_RELAY_ENABLED = _env_bool("PJSK_RELAY_ENABLED", True)
-PJSK_LOCAL_GUESS_ENABLED = _env_bool("PJSK_LOCAL_GUESS_ENABLED", True)
-
-
-def _haruki_ws_url(value: str) -> str:
-    """Return the fixed Haruki reverse-WS route for the local deployment.
-
-    Older private ``.env`` files used the TCP root (``:8111``).  Keeping that
-    value would make the connector establish the wrong HTTP route and then
-    retry forever.  Normalize only the known local Haruki listener; custom
-    operator-controlled wrappers keep their explicit path unchanged.
-    """
-
-    parsed = urlsplit(value)
-    if (
-        parsed.scheme in {"ws", "wss"}
-        and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
-        and parsed.port == 8111
-        and parsed.path in {"", "/"}
-        and not parsed.query
-        and not parsed.fragment
-    ):
-        return value.rstrip("/") + "/ws"
-    return value
-
-
-# Haruki's OneBot reverse WebSocket is exposed at the fixed ``/ws`` path.
-# Keep the environment override for deployments that wrap it, but do not make
-# the default point at the TCP root: the Haruki client accepts the connection
-# there only as an HTTP/WebSocket route mismatch and never delivers replies.
-HARUKI_WS_URL = _haruki_ws_url(os.getenv("HARUKI_WS_URL", "ws://127.0.0.1:8111/ws"))
+# Haruki Client v3 exposes its reverse OneBot WebSocket at /ws.
+HARUKI_WS_URL = _normalize_haruki_ws_url(
+    os.getenv("HARUKI_WS_URL", "ws://127.0.0.1:8111/ws")
+)
 SAKURA_WS_URL = os.getenv("SAKURA_WS_URL", "ws://101.34.19.31:13888/onebot/v11/ws")
 HARUKI_TOKEN = os.getenv("HARUKI_TOKEN", "")
 SAKURA_TOKEN = os.getenv("SAKURA_TOKEN", "")
-
-
-def _auth_scheme(name: str, default: str) -> str:
-    """Normalize the operator-selected OneBot reverse-WS auth scheme."""
-
-    raw = os.getenv(name, default).strip().lower()
-    if raw == "token":
-        return "Token"
-    if raw == "bearer":
-        return "Bearer"
-    # Keep an invalid environment value from breaking plugin import. The
-    # selected default is safe and this value never comes from a user message.
-    return default
-
-
-HARUKI_AUTH_SCHEME = _auth_scheme("HARUKI_AUTH_SCHEME", "Bearer")
-SAKURA_AUTH_SCHEME = _auth_scheme("SAKURA_AUTH_SCHEME", "Token")
 
 # A reverse-WS client must identify itself consistently.  The old gateway
 # selected a random ID on every reconnect, which is rejected by strict
@@ -206,13 +179,6 @@ SAKURA_CMDS = {
     _u(r"\u5173\u95edlive\u63a8\u9001"), _u(r"\u5173\u95edlive\u901a\u77e5"),
 }
 
-LOCAL_GUESS_CMDS = {
-    _u(r"\u731c\u6b4c"), _u(r"\u731c\u66f2\u7ed8"), _u(r"\u731c\u5361\u9762"),
-    _u(r"\u731c\u8c31\u9762"), _u(r"\u968f\u673a\u6311\u6218"),
-    _u(r"\u542c\u6b4c\u8bc6\u66f2"), _u(r"\u7ed3\u675f\u731c\u66f2"),
-    _u(r"\u7ed3\u675f\u731c\u5361\u9762"), _u(r"\u7ed3\u675f\u731c\u9898"),
-}
-
 
 def _load_documented_haruki_commands() -> set[str]:
     """Load the generated Haruki NEO command catalog without network access."""
@@ -252,13 +218,16 @@ class ReplyTarget:
     event: Any
     user_id: str
     group_id: str | None
+    self_id: str = ""
     real_user_id: str | None = None
     real_group_id: str | None = None
 
 
 _backend_ws: dict[str, Any] = {"haruki": None, "sakura": None}
-_backend_state: dict[str, str] = {"haruki": "BACKOFF", "sakura": "BACKOFF"}
-_reply_routes: dict[tuple[str, str], ReplyTarget] = {}
+_reply_routes: dict[str, ReplyTarget] = {}
+# Legacy entries are kept only for callers/tests that predate scoped routes.  The
+# target identity guards against stale metadata after a direct map assignment.
+_legacy_route_kinds: dict[str, tuple[ReplyTarget, str]] = {}
 _tasks: list[asyncio.Task] = []
 _heartbeat_tasks: set[asyncio.Task] = set()
 _message_cache: dict[str, float] = {}
@@ -293,14 +262,7 @@ def _headers(self_id: str, token: str = "") -> dict[str, str]:
         "X-Impl": WS_IMPL,
     }
     if token:
-        # Sakura's OneBot reverse-WS reference client uses Token auth. Keep
-        # Haruki's historical Bearer default; both are operator-configurable.
-        scheme = (
-            SAKURA_AUTH_SCHEME
-            if str(self_id) == str(SAKURA_BOT_ID)
-            else HARUKI_AUTH_SCHEME
-        )
-        headers["Authorization"] = f"{scheme} {token}"
+        headers["Authorization"] = f"Bearer {token}"
     return headers
 
 
@@ -378,8 +340,6 @@ def _match_command(text: str, commands: set[str]) -> bool:
 
 def _route_for(text: str) -> tuple[bool, bool, bool]:
     check = text.lstrip("/")
-    if PJSK_LOCAL_GUESS_ENABLED and _match_command(check, LOCAL_GUESS_CMDS):
-        return False, False, True
     if any(pattern.match(check) for pattern in LOCAL_ONLY_RE):
         return False, False, True
     if COMPACT_B39_RE.match(check):
@@ -416,8 +376,54 @@ def _route_for(text: str) -> tuple[bool, bool, bool]:
     return False, False, False
 
 
-def _prepend_slash(raw_payload: str, pure_msg: str, cq_prefix: str) -> str:
+def _numeric_id(value: Any) -> int | None:
+    if value is None:
+        return None
+    text = str(value)
+    return int(text) if text.isdigit() else None
+
+
+def _resolve_real_qq(user_id: str, self_id: str) -> str | None:
+    if not get_real_qq:
+        return None
+    resolved = get_real_qq(str(user_id), str(self_id))
+    return None if resolved is None else str(resolved)
+
+
+def _resolve_real_group(group_id: str | None, self_id: str) -> str | None:
+    if group_id is None or not get_real_group:
+        return None
+    resolved = get_real_group(str(group_id), str(self_id))
+    return None if resolved is None else str(resolved)
+
+
+def _rewrite_numeric_field(data: dict[str, Any], field: str, resolved: str | None) -> None:
+    numeric = _numeric_id(resolved)
+    if numeric is not None and field in data:
+        data[field] = numeric
+
+
+def _rewrite_payload_ids(
+    data: dict[str, Any],
+    real_user_id: str | None,
+    real_group_id: str | None,
+) -> None:
+    _rewrite_numeric_field(data, "user_id", real_user_id)
+    sender = data.get("sender")
+    if isinstance(sender, dict):
+        _rewrite_numeric_field(sender, "user_id", real_user_id)
+    _rewrite_numeric_field(data, "group_id", real_group_id)
+
+
+def _prepend_slash(
+    raw_payload: str,
+    pure_msg: str,
+    cq_prefix: str,
+    real_user_id: str | None = None,
+    real_group_id: str | None = None,
+) -> str:
     data = _loads(raw_payload)
+    _rewrite_payload_ids(data, real_user_id, real_group_id)
     command = pure_msg.strip()
     if not command.startswith("/"):
         command = "/" + command
@@ -435,43 +441,22 @@ def _prepend_slash(raw_payload: str, pure_msg: str, cq_prefix: str) -> str:
     return _dumps(data)
 
 
-def _id_with_original_type(original: Any, replacement: str) -> Any:
-    if isinstance(original, int) and not isinstance(original, bool) and replacement.isdigit():
-        return int(replacement)
-    return replacement
-
-
-def _rewrite_backend_identity(
-    raw_payload: str, bot_scope: str, *, backend_self_id: Any = None
+def _rewrite_for_sakura(
+    raw_payload: str,
+    virtual_user_id: Any,
+    self_id: str = "",
+    virtual_group_id: Any = None,
+    real_user_id: str | None = None,
+    real_group_id: str | None = None,
 ) -> str:
     data = _loads(raw_payload)
-    if backend_self_id is not None:
-        data["self_id"] = backend_self_id
-
-    if get_real_qq and data.get("user_id") is not None:
-        real_user_id = get_real_qq(str(data["user_id"]), bot_scope)
-        if real_user_id is not None:
-            real_user_id = str(real_user_id)
-            if real_user_id.isdigit():
-                data["user_id"] = _id_with_original_type(data["user_id"], real_user_id)
-                if isinstance(data.get("sender"), dict) and data["sender"].get("user_id") is not None:
-                    data["sender"]["user_id"] = _id_with_original_type(
-                        data["sender"]["user_id"], real_user_id
-                    )
-
-    if get_real_group and data.get("group_id") is not None:
-        real_group_id = get_real_group(str(data["group_id"]), bot_scope)
-        if real_group_id is not None:
-            real_group_id = str(real_group_id)
-            if real_group_id.isdigit():
-                data["group_id"] = _id_with_original_type(data["group_id"], real_group_id)
+    if real_user_id is None:
+        real_user_id = _resolve_real_qq(str(virtual_user_id), str(self_id))
+    if real_group_id is None and virtual_group_id is not None:
+        real_group_id = _resolve_real_group(str(virtual_group_id), str(self_id))
+    _rewrite_payload_ids(data, real_user_id, real_group_id)
+    data["self_id"] = int(SAKURA_BOT_ID)
     return _dumps(data)
-
-
-def _rewrite_for_sakura(raw_payload: str, bot_scope: str) -> str:
-    return _rewrite_backend_identity(
-        raw_payload, bot_scope, backend_self_id=int(SAKURA_BOT_ID)
-    )
 
 
 def _event_payload(event: Any) -> str:
@@ -484,48 +469,238 @@ def _event_payload(event: Any) -> str:
     return _dumps(data)
 
 
+def _event_self_id(event: Any) -> str:
+    self_id = getattr(event, "self_id", None)
+    return _normalize_scope(self_id)
+
+
 def _event_user_id(event: Any) -> str:
-    return str(getattr(event, "user_id", ""))
+    user_id = getattr(event, "user_id", None)
+    return "" if user_id is None else str(user_id)
 
 
 def _event_group_id(event: Any) -> str | None:
     group_id = getattr(event, "group_id", None)
-    return str(group_id) if group_id else None
+    return None if group_id is None else str(group_id)
 
 
-def _identity_log_value(value: Any) -> str:
-    """Keep opaque identity values safe for one-line audit logs."""
+def _normalize_scope(value: Any) -> str:
+    return "" if value is None else str(value).strip()
 
-    if value is None or value == "":
-        return "-"
-    return str(value).replace("\r", "\\r").replace("\n", "\\n")[:160]
+
+def _normalize_source(source: Any) -> str:
+    return _normalize_scope(source).lower()
+
+
+def _scoped_route_key(source: str, scope: str, route_key: str) -> str:
+    return f"{_normalize_source(source)}|{_normalize_scope(scope)}|{route_key}"
+
+
+def _target_scope(target: ReplyTarget) -> str:
+    scope = _normalize_scope(target.self_id)
+    if scope:
+        return scope
+    return _normalize_scope(getattr(target.bot, "self_id", ""))
+
+
+def _route_kind(route_key: str) -> str:
+    if route_key.startswith("group_"):
+        return "group"
+    if route_key.startswith("user_"):
+        return "private"
+    raise ValueError(f"unknown PJSK route key: {route_key}")
+
+
+def _target_matches_destination(
+    target: ReplyTarget,
+    destination: str,
+    route_key: str,
+    *,
+    legacy_route: bool = False,
+) -> bool:
+    if _route_kind(route_key) != destination:
+        return False
+    if destination == "group":
+        return target.group_id is not None
+    if not target.user_id:
+        return False
+    if target.group_id is None:
+        return True
+    if not legacy_route:
+        return False
+    legacy_kind = _legacy_route_kinds.get(route_key)
+    return legacy_kind is not None and legacy_kind[0] is target and legacy_kind[1] == "private"
 
 
 def _route_keys(
     user_id: str,
     group_id: str | None,
+    *,
     real_user_id: str | None = None,
     real_group_id: str | None = None,
 ) -> list[str]:
-    keys = [f"user_{user_id}"]
-    if real_user_id and real_user_id != user_id:
-        keys.append(f"user_{real_user_id}")
-    if group_id:
-        keys.insert(0, f"group_{group_id}")
-    if real_group_id and real_group_id != group_id:
-        keys.insert(0, f"group_{real_group_id}")
+    keys: list[str] = []
+    seen: set[str] = set()
+    for prefix, values in (
+        ("group", (group_id, real_group_id)),
+        ("user", (user_id, real_user_id)),
+    ):
+        for value in values:
+            if value is None:
+                continue
+            key = f"{prefix}_{_normalize_scope(value)}"
+            if key not in seen:
+                keys.append(key)
+                seen.add(key)
     return keys
 
 
-def _register_route(target: ReplyTarget, backends: list[str]) -> None:
-    for backend in backends:
-        for key in _route_keys(
-            target.user_id,
-            target.group_id,
-            target.real_user_id,
-            target.real_group_id,
+def _register_route(target: ReplyTarget, source: str | None = None) -> None:
+    target.self_id = _normalize_scope(target.self_id)
+    if target.real_user_id is None:
+        target.real_user_id = _resolve_real_qq(target.user_id, target.self_id)
+    if target.group_id is not None and target.real_group_id is None:
+        target.real_group_id = _resolve_real_group(target.group_id, target.self_id)
+
+    route_keys = _route_keys(
+        target.user_id,
+        target.group_id,
+        real_user_id=target.real_user_id,
+        real_group_id=target.real_group_id,
+    )
+    if source is None:
+        # Compatibility for callers that still populate the historical
+        # unscoped table. Production dispatch always supplies a backend source.
+        for key in route_keys:
+            _reply_routes[key] = target
+            _legacy_route_kinds[key] = (target, _route_kind(key))
+        return
+
+    target_kind = "group" if target.group_id is not None else "private"
+    scope = _target_scope(target)
+    for key in route_keys:
+        if _route_kind(key) != target_kind:
+            continue
+        scoped_key = _scoped_route_key(source, scope, key)
+        _reply_routes[scoped_key] = target
+
+
+def _backend_destination(action: Any, params: dict[str, Any]) -> str | None:
+    action_name = str(action or "")
+    action_destination: str | None = None
+    if action_name == "send_group_msg":
+        action_destination = "group"
+    elif action_name in {"send_private_msg", "send_private_msg_wakeup"}:
+        action_destination = "private"
+    elif action_name not in {"send", "send_msg"}:
+        return None
+
+    message_type = _normalize_scope(params.get("message_type")).lower()
+    if message_type and message_type not in {"group", "private"}:
+        return None
+    if action_destination is not None:
+        if message_type and message_type != action_destination:
+            return None
+        return action_destination
+    if message_type:
+        return message_type
+
+    has_group_id = params.get("group_id") is not None
+    has_user_id = params.get("user_id") is not None
+    if has_group_id and has_user_id:
+        return None
+    if has_group_id:
+        return "group"
+    if has_user_id:
+        return "private"
+    return None
+
+
+def _route_key_for_destination(
+    destination: str,
+    group_id: Any,
+    user_id: Any,
+) -> str | None:
+    if destination == "group":
+        return None if group_id is None else f"group_{_normalize_scope(group_id)}"
+    return None if user_id is None else f"user_{_normalize_scope(user_id)}"
+
+
+def _requested_route_scope(params: dict[str, Any]) -> str | None:
+    for field in ("self_id", "scope", "qbind_self_id", "bot_id"):
+        value = params.get(field)
+        if value is not None:
+            return _normalize_scope(value)
+    return None
+
+
+def _find_backend_route(
+    source: str,
+    action: Any,
+    params: dict[str, Any],
+) -> tuple[ReplyTarget, bool] | None:
+    destination = _backend_destination(action, params)
+    if destination is None:
+        return None
+    route_key = _route_key_for_destination(
+        destination,
+        params.get("group_id"),
+        params.get("user_id"),
+    )
+    if route_key is None:
+        return None
+
+    normalized_source = _normalize_source(source)
+    source_prefix = f"{normalized_source}|"
+    route_suffix = f"|{route_key}"
+    requested_scope = _requested_route_scope(params)
+    candidates: list[tuple[str, ReplyTarget]] = []
+    has_scoped_routes = False
+    for key, target in _reply_routes.items():
+        if not key.startswith(source_prefix):
+            continue
+        has_scoped_routes = True
+        if not key.endswith(route_suffix):
+            continue
+        scope = key[len(source_prefix):-len(route_suffix)]
+        if requested_scope is not None and scope != requested_scope:
+            continue
+        if _target_matches_destination(target, destination, route_key):
+            candidates.append((scope, target))
+
+    if candidates:
+        scopes = {scope for scope, _target in candidates}
+        targets = {id(target) for _scope, target in candidates}
+        if len(scopes) > 1 or len(targets) > 1:
+            logger.warning(
+                "PJSK backend route is ambiguous: "
+                f"source={normalized_source} route={route_key} scopes={sorted(scopes)!r}"
+            )
+            return None
+        return candidates[0][1], False
+
+    # Once a source has scoped routes, an unscoped fallback could silently
+    # select the wrong qbind scope. Legacy fallback is only for old callers
+    # that populated the unscoped table and have no scoped entries at all.
+    if has_scoped_routes:
+        return None
+    target = _reply_routes.get(route_key)
+    if target is not None:
+        if requested_scope is not None and _target_scope(target) != requested_scope:
+            logger.warning(
+                "PJSK legacy backend route scope mismatch: "
+                f"source={normalized_source} route={route_key} "
+                f"requested_scope={requested_scope!r} target_scope={_target_scope(target)!r}"
+            )
+            return None
+        if _target_matches_destination(
+            target,
+            destination,
+            route_key,
+            legacy_route=True,
         ):
-            _reply_routes[(backend, key)] = target
+            return target, True
+    return None
 
 
 async def _download_remote_image(session: aiohttp.ClientSession, url: str) -> str | None:
@@ -665,28 +840,62 @@ def _markdownize_plain_urls(message: Message, bot: Any) -> Message:
     return Message(converted) if changed else message
 
 
-async def _deliver_backend_message(target: ReplyTarget, action: str, params: dict[str, Any]) -> dict[str, Any]:
+def _target_api_id(
+    target_id: str | None,
+    requested_id: Any,
+    real_id: str | None,
+) -> Any:
+    if target_id is None:
+        return requested_id
+    if requested_id is not None and str(requested_id) == target_id:
+        return requested_id
+    if real_id is not None and requested_id is not None and str(requested_id) == real_id:
+        return target_id
+    return target_id
+
+
+async def _deliver_backend_message(
+    target: ReplyTarget,
+    action: str,
+    params: dict[str, Any],
+    *,
+    legacy_route: bool = False,
+) -> dict[str, Any]:
+    destination = _backend_destination(action, params)
+    route_key = _route_key_for_destination(
+        destination,
+        params.get("group_id"),
+        params.get("user_id"),
+    ) if destination is not None else None
+    if route_key is None or not _target_matches_destination(
+        target,
+        destination,
+        route_key,
+        legacy_route=legacy_route,
+    ):
+        raise ValueError(
+            f"PJSK backend target type mismatch: destination={destination} route={route_key}"
+        )
+
     message = await _message_from_api(params.get("message", ""))
     message = _markdownize_plain_urls(message, target.bot)
-    original_group_id = getattr(target.event, "group_id", target.group_id)
-    original_user_id = getattr(target.event, "user_id", target.user_id)
-    group_id = original_group_id if original_group_id is not None else params.get("group_id")
-    user_id = original_user_id if original_user_id is not None else params.get("user_id")
+    requested_group_id = params.get("group_id")
+    requested_user_id = params.get("user_id")
 
-    if action in {"send_group_msg"} or (action == "send_msg" and group_id):
+    if destination == "group":
+        group_id = _target_api_id(target.group_id, requested_group_id, target.real_group_id)
         if hasattr(target.bot, "send_group_msg"):
             # Release010 may use non-numeric OpenID-like identifiers.  Keep the
             # adapter value opaque instead of forcing an int conversion.
             result = await target.bot.send_group_msg(group_id=group_id, message=message)
         else:
             result = await target.bot.send(target.event, message)
-    elif action in {"send_private_msg", "send_private_msg_wakeup"} or (action == "send_msg" and user_id):
+    else:
+        user_id = _target_api_id(target.user_id, requested_user_id, target.real_user_id)
         if hasattr(target.bot, "send_private_msg"):
             result = await target.bot.send_private_msg(user_id=user_id, message=message)
         else:
             result = await target.bot.send(target.event, message)
-    else:
-        result = await target.bot.send(target.event, message)
 
     if isinstance(result, dict):
         return result
@@ -713,16 +922,22 @@ async def _process_backend_api(message: str, source: str, source_ws: Any) -> Non
 
         if action in {"send", "send_msg", "send_group_msg", "send_private_msg", "send_private_msg_wakeup"}:
             params = data.get("params") or {}
-            gid = params.get("group_id")
-            uid = params.get("user_id")
-            target = _reply_routes.get((source, f"group_{gid}")) if gid else None
-            target = target or (
-                _reply_routes.get((source, f"user_{uid}")) if uid else None
-            )
-            if target:
-                result = await _deliver_backend_message(target, action, params)
-                await _ws_send(source_ws, _dumps({"status": "ok", "retcode": 0, "data": result, "echo": echo}))
-            elif echo:
+            match = _find_backend_route(source, action, params)
+            if match is not None:
+                target, legacy_route = match
+                try:
+                    result = await _deliver_backend_message(
+                        target,
+                        action,
+                        params,
+                        legacy_route=legacy_route,
+                    )
+                except ValueError as exc:
+                    logger.warning(f"PJSK backend route rejected: source={source} reason={exc}")
+                else:
+                    await _ws_send(source_ws, _dumps({"status": "ok", "retcode": 0, "data": result, "echo": echo}))
+                    return
+            if echo:
                 await _ws_send(source_ws, _dumps({"status": "failed", "retcode": 1, "data": None, "echo": echo}))
             return
 
@@ -735,10 +950,8 @@ async def _process_backend_api(message: str, source: str, source_ws: Any) -> Non
 async def _maintain_backend(name: str, url: str, token: str, self_id: str) -> None:
     fail_count = 0
     while True:
-        _backend_state[name] = "CONNECTING"
         cancelled = False
         heartbeat_task: asyncio.Task | None = None
-        disabled = False
         try:
             logger.info(
                 "PJSK backend connecting: "
@@ -749,7 +962,6 @@ async def _maintain_backend(name: str, url: str, token: str, self_id: str) -> No
                 async with session.ws_connect(url, headers=_headers(self_id, token), timeout=15) as ws:
                     _backend_ws[name] = ws
                     fail_count = 0
-                    _backend_state[name] = "CONNECTED"
                     logger.info(f"PJSK backend connected: backend={name} endpoint={_url_label(url)} self_id={self_id}")
                     await _mock_lifecycle(ws, self_id)
                     heartbeat_task = asyncio.create_task(_mock_heartbeat(ws, self_id))
@@ -769,24 +981,14 @@ async def _maintain_backend(name: str, url: str, token: str, self_id: str) -> No
                 f"PJSK backend disconnected: backend={name} endpoint={_url_label(url)} "
                 f"reason={_classify_connection_error(exc)}"
             )
-            if name == "sakura" and fail_count >= 3:
-                disabled = True
-                _backend_state[name] = "DISABLED"
-                logger.error(
-                    "PJSK backend disabled: backend=sakura state=DISABLED "
-                    "reason=3_consecutive_failures restart_required=true"
-                )
         finally:
             _backend_ws[name] = None
             if heartbeat_task:
                 heartbeat_task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
                     await heartbeat_task
-            if not cancelled and not disabled:
-                _backend_state[name] = "BACKOFF"
+            if not cancelled:
                 await asyncio.sleep(_backoff(fail_count))
-        if disabled:
-            return
 
 
 async def dispatch_message(bot: Any, event: Any) -> dict[str, Any]:
@@ -803,56 +1005,20 @@ async def dispatch_message(bot: Any, event: Any) -> dict[str, Any]:
     if blocked or not (haruki or sakura):
         return {"matched": False, "blocked": blocked, "sent": []}
 
-    scope_value = getattr(bot, "self_id", None) or getattr(event, "self_id", None)
-    scope = str(scope_value).strip() if scope_value is not None else ""
-    if not scope or not callable(ensure_context_bound):
-        logger.error("PJSK relay blocked: QBind identity gate is unavailable")
-        return {
-            "matched": True,
-            "blocked": True,
-            "reason": "identity_provider_unavailable",
-            "sent": [],
-        }
-
-    try:
-        if not await ensure_context_bound(event, bot):
-            return {
-                "matched": True,
-                "blocked": True,
-                "reason": "identity_unbound",
-                "sent": [],
-            }
-        user_id = _event_user_id(event)
-        group_id = _event_group_id(event)
-        real_user_id = get_real_qq(user_id, scope) if get_real_qq else None
-        real_group_id = (
-            get_real_group(group_id, scope)
-            if group_id is not None and get_real_group
-            else None
-        )
-    except Exception:
-        logger.exception("PJSK relay blocked: QBind identity resolution failed")
-        return {
-            "matched": True,
-            "blocked": True,
-            "reason": "identity_resolution_failed",
-            "sent": [],
-        }
-
-    if real_user_id is None or (group_id is not None and real_group_id is None):
-        logger.error("PJSK relay blocked: bound identity could not be resolved")
-        return {
-            "matched": True,
-            "blocked": True,
-            "reason": "identity_resolution_failed",
-            "sent": [],
-        }
-
     logger.info(
         f"PJSK relay routing command={raw_msg!r} haruki={haruki} sakura={sakura}"
     )
 
-    cache_key = f"{group_id or 0}:{user_id}:{raw_msg}"
+    self_id = _event_self_id(event)
+    user_id = _event_user_id(event)
+    group_id = _event_group_id(event)
+    cache_key = "\x1f".join((
+        _normalize_scope(self_id),
+        _normalize_scope(getattr(bot, "self_id", "")),
+        _normalize_scope(group_id) or "0",
+        _normalize_scope(user_id),
+        raw_msg,
+    ))
     now = time.time()
     for key, seen in list(_message_cache.items()):
         if now - seen > 1.5:
@@ -866,35 +1032,40 @@ async def dispatch_message(bot: Any, event: Any) -> dict[str, Any]:
         event=event,
         user_id=user_id,
         group_id=group_id,
-        real_user_id=str(real_user_id),
-        real_group_id=str(real_group_id) if real_group_id is not None else None,
+        self_id=self_id,
     )
-    available_backends = [
-        name
-        for name, selected in (("sakura", sakura), ("haruki", haruki))
-        if selected and _backend_ws[name]
-    ]
-    logger.info(
-        "PJSK identity audit: "
-        f"bot={_identity_log_value(scope)} "
-        f"virtual_user={_identity_log_value(user_id)} "
-        f"real_user={_identity_log_value(real_user_id)} "
-        f"virtual_group={_identity_log_value(group_id)} "
-        f"real_group={_identity_log_value(real_group_id)} "
-        f"backends={','.join(available_backends) or '-'}"
-    )
-    _register_route(target, available_backends)
+    if sakura:
+        _register_route(target, source="sakura")
+    if haruki:
+        _register_route(target, source="haruki")
     raw_payload = _event_payload(event)
     sent: list[str] = []
     if sakura and _backend_ws["sakura"]:
-        await _ws_send(_backend_ws["sakura"], _rewrite_for_sakura(raw_payload, scope))
+        await _ws_send(
+            _backend_ws["sakura"],
+            _rewrite_for_sakura(
+                raw_payload,
+                user_id,
+                self_id=self_id,
+                virtual_group_id=group_id,
+                real_user_id=target.real_user_id,
+                real_group_id=target.real_group_id,
+            ),
+        )
         sent.append("sakura")
     if haruki and _backend_ws["haruki"]:
         match = re.match(r"^(\s*(?:\[CQ:[^\]]+\]\s*)*)(.*)$", raw_msg)
         cq_prefix, pure_msg = (match.group(1), match.group(2)) if match else ("", raw_msg)
-        haruki_payload = _prepend_slash(raw_payload, pure_msg, cq_prefix)
-        haruki_payload = _rewrite_backend_identity(haruki_payload, scope)
-        await _ws_send(_backend_ws["haruki"], haruki_payload)
+        await _ws_send(
+            _backend_ws["haruki"],
+            _prepend_slash(
+                raw_payload,
+                pure_msg,
+                cq_prefix,
+                target.real_user_id,
+                target.real_group_id,
+            ),
+        )
         sent.append("haruki")
     logger.info(f"PJSK relay dispatched command={raw_msg!r} backends={sent}")
     return {"matched": True, "blocked": False, "sent": sent}
@@ -925,5 +1096,5 @@ async def stop_gateway() -> None:
         await asyncio.gather(*_heartbeat_tasks, return_exceptions=True)
     _heartbeat_tasks.clear()
     _reply_routes.clear()
+    _legacy_route_kinds.clear()
     _message_cache.clear()
-
